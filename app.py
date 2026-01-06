@@ -7,6 +7,7 @@ import asyncio
 import importlib.util
 import random
 import secrets
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional, List, Any, AsyncGenerator, Tuple
@@ -20,7 +21,6 @@ import httpx
 import tiktoken
 
 from db import init_db, close_db, row_to_dict
-from message_processor import process_history_for_amazonq, merge_duplicate_tool_results
 
 # ------------------------------------------------------------------------------
 # Tokenizer
@@ -434,6 +434,8 @@ async def refresh_access_token_in_db(account_id: str) -> Dict[str, Any]:
 
         new_access = data.get("accessToken")
         new_refresh = data.get("refreshToken", acc.get("refreshToken"))
+        expires_in = data.get("expiresIn", 3600)  # Default 1 hour if not provided
+        expires_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() + expires_in))
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         status = "success"
     except httpx.HTTPError as e:
@@ -469,10 +471,10 @@ async def refresh_access_token_in_db(account_id: str) -> Dict[str, Any]:
     await _db.execute(
         """
         UPDATE accounts
-        SET accessToken=?, refreshToken=?, last_refresh_time=?, last_refresh_status=?, updated_at=?
+        SET accessToken=?, refreshToken=?, expires_at=?, last_refresh_time=?, last_refresh_status=?, updated_at=?
         WHERE id=?
         """,
-        (new_access, new_refresh, now, status, now, account_id),
+        (new_access, new_refresh, expires_at, now, status, now, account_id),
     )
 
     row2 = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (account_id,))
@@ -565,103 +567,63 @@ def _sse_format(obj: Dict[str, Any]) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 @app.post("/v1/messages")
-async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(require_account)):
+async def claude_messages(
+    req: ClaudeRequest,
+    account: Dict[str, Any] = Depends(require_account),
+    x_conversation_id: Optional[str] = Header(default=None, alias="x-conversation-id")
+):
     """
     Claude-compatible messages endpoint.
     """
     # 1. Convert request
+    # Always generate a new conversation_id like amq2api does
+    # Using the same conversation_id can cause Amazon Q to return cached/stale data
     try:
-        aq_request = convert_claude_to_amazonq_request(req)
+        aq_request = convert_claude_to_amazonq_request(req, conversation_id=None)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=f"Request conversion failed: {str(e)}")
 
-    # 2. Post-process: merge consecutive user messages and duplicate toolResults
-    try:
-        conversation_state = aq_request.get("conversationState", {})
-        history = conversation_state.get("history", [])
+    # Post-process history to fix message ordering (prevents infinite loops)
+    from message_processor import process_claude_history_for_amazonq
+    conversation_state = aq_request.get("conversationState", {})
+    history = conversation_state.get("history", [])
+    if history:
+        processed_history = process_claude_history_for_amazonq(history)
+        aq_request["conversationState"]["history"] = processed_history
 
-        if history:
-            # Merge consecutive user messages
-            processed_history = process_history_for_amazonq(history)
-            conversation_state["history"] = processed_history
-            aq_request["conversationState"] = conversation_state
+    # Remove duplicate tail userInputMessage that matches currentMessage content
+    # This prevents the model from repeatedly responding to the same user message
+    conversation_state = aq_request.get("conversationState", {})
+    current_msg = conversation_state.get("currentMessage", {}).get("userInputMessage", {})
+    current_content = (current_msg.get("content") or "").strip()
+    history = conversation_state.get("history", [])
 
-        # Merge duplicate toolResults in currentMessage
-        current_message = conversation_state.get("currentMessage", {})
-        user_input_message = current_message.get("userInputMessage", {})
-        user_input_message_context = user_input_message.get("userInputMessageContext", {})
+    if history and current_content:
+        last = history[-1]
+        if "userInputMessage" in last:
+            last_content = (last["userInputMessage"].get("content") or "").strip()
+            if last_content and last_content == current_content:
+                # Remove duplicate tail userInputMessage
+                history = history[:-1]
+                aq_request["conversationState"]["history"] = history
+                import logging
+                logging.getLogger(__name__).info("Removed duplicate tail userInputMessage to prevent repeated response")
 
-        tool_results = user_input_message_context.get("toolResults", [])
-        if tool_results:
-            merged_tool_results = merge_duplicate_tool_results(tool_results)
-            user_input_message_context["toolResults"] = merged_tool_results
-            user_input_message["userInputMessageContext"] = user_input_message_context
-            current_message["userInputMessage"] = user_input_message
-            conversation_state["currentMessage"] = current_message
-            aq_request["conversationState"] = conversation_state
-    except Exception as e:
-        # Log but don't fail - the original request might still work
-        traceback.print_exc()
-        print(f"Warning: Post-processing failed: {e}")
+    conversation_state = aq_request.get("conversationState", {})
+    conversation_id = conversation_state.get("conversationId")
+    response_headers: Dict[str, str] = {}
+    if conversation_id:
+        response_headers["x-conversation-id"] = conversation_id
 
-    # 3. Send upstream
-    async def _send_upstream_raw() -> Tuple[Optional[str], Optional[AsyncGenerator[str, None]], Any, Optional[AsyncGenerator[Any, None]]]:
-        access = account.get("accessToken")
-        if not access:
-            refreshed = await refresh_access_token_in_db(account["id"])
-            access = refreshed.get("accessToken")
-            if not access:
-                raise HTTPException(status_code=502, detail="Access token unavailable after refresh")
-
-        # We use the modified send_chat_request which accepts raw_payload
-        # and returns (text, text_stream, tracker, event_stream)
-        return await send_chat_request(
-            access_token=access,
-            messages=[], # Not used when raw_payload is present
-            model=req.model,
-            stream=req.stream,
-            client=GLOBAL_CLIENT,
-            raw_payload=aq_request
-        )
-
-    try:
-        _, _, tracker, event_stream = await _send_upstream_raw()
-        
-        if not req.stream:
-            # Non-streaming: we need to consume the stream and build response
-            # But wait, send_chat_request with stream=False returns text, but we need structured response
-            # Actually, for Claude format, we might want to parse the events even for non-streaming
-            # to get tool calls etc correctly.
-            # However, our modified send_chat_request returns event_stream if raw_payload is used AND stream=True?
-            # Let's check replicate.py modification.
-            # If stream=False, it returns text. But text might not be enough for tool calls.
-            # For simplicity, let's force stream=True internally and aggregate if req.stream is False.
-            pass
-    except Exception as e:
-        await _update_stats(account["id"], False)
-        raise
-
-    # We always use streaming upstream to handle events properly
-    try:
-        # Force stream=True for upstream to get events
-        # But wait, send_chat_request logic: if stream=True, returns event_stream
-        # We need to call it with stream=True
-        pass
-    except:
-        pass
-        
-    # Re-implementing logic to be cleaner
-    
     # Always stream from upstream to get full event details
     event_iter = None
-    first_event_received = False
     try:
         access = account.get("accessToken")
         if not access:
             refreshed = await refresh_access_token_in_db(account["id"])
             access = refreshed.get("accessToken")
-        
+
         # We call with stream=True to get the event iterator
         _, _, tracker, event_iter = await send_chat_request(
             access_token=access,
@@ -671,7 +633,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
             client=GLOBAL_CLIENT,
             raw_payload=aq_request
         )
-        
+
         if not event_iter:
              raise HTTPException(status_code=502, detail="No event stream returned")
 
@@ -685,7 +647,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                 for item in req.system:
                     if isinstance(item, dict) and item.get("type") == "text":
                         text_to_count += item.get("text", "")
-        
+
         for msg in req.messages:
             if isinstance(msg.content, str):
                 text_to_count += msg.content
@@ -695,19 +657,24 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                         text_to_count += item.get("text", "")
 
         input_tokens = count_tokens(text_to_count, apply_multiplier=True)
-        handler = ClaudeStreamHandler(model=req.model, input_tokens=input_tokens)
+        handler = ClaudeStreamHandler(model=req.model, input_tokens=input_tokens, conversation_id=conversation_id)
 
         # Try to get the first event to ensure the connection is valid
         # This allows us to return proper HTTP error codes before starting the stream
         first_event = None
         try:
             first_event = await event_iter.__anext__()
-            first_event_received = True
         except StopAsyncIteration:
             raise HTTPException(status_code=502, detail="Empty response from upstream")
         except Exception as e:
             # If we get an error before the first event, we can still return proper status code
-            raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
+            err_msg = str(e)
+            # Extract upstream status code from "Upstream error {code}: {message}"
+            if err_msg.startswith("Upstream error "):
+                match = re.match(r"Upstream error (\d+):", err_msg)
+                if match:
+                    raise HTTPException(status_code=int(match.group(1)), detail=err_msg)
+            raise HTTPException(status_code=502, detail=f"Upstream error: {err_msg}")
 
         async def event_generator():
             try:
@@ -716,7 +683,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                     event_type, payload = first_event
                     async for sse in handler.handle_event(event_type, payload):
                         yield sse
-                
+
                 # Process remaining events
                 async for event_type, payload in event_iter:
                     async for sse in handler.handle_event(event_type, payload):
@@ -732,25 +699,29 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                 raise
 
         if req.stream:
-            return StreamingResponse(event_generator(), media_type="text/event-stream")
+            return StreamingResponse(
+                event_generator(),
+                media_type="text/event-stream",
+                headers=response_headers or None
+            )
         else:
             # Accumulate for non-streaming
             # This is a bit complex because we need to reconstruct the full response object
             # For now, let's just support streaming as it's the main use case for Claude Code
             # But to be nice, let's try to support non-streaming by consuming the generator
-            
+
             content_blocks = []
             usage = {"input_tokens": 0, "output_tokens": 0}
             stop_reason = None
-            
+
             # We need to parse the SSE strings back to objects... inefficient but works
             # Or we could refactor handler to yield objects.
             # For now, let's just raise error for non-streaming or implement basic text
             # Claude Code uses streaming.
-            
+
             # Let's implement a basic accumulator from the SSE stream
             final_content = []
-            
+
             async for sse_chunk in event_generator():
                 data_str = None
                 # Each chunk from the generator can have multiple lines ('event:', 'data:').
@@ -759,20 +730,20 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                     if line.startswith("data:"):
                         data_str = line[6:].strip()
                         break
-                
+
                 if not data_str or data_str == "[DONE]":
                     continue
-                
+
                 try:
                     data = json.loads(data_str)
                     dtype = data.get("type")
-                    
+
                     if dtype == "content_block_start":
                         idx = data.get("index", 0)
                         while len(final_content) <= idx:
                             final_content.append(None)
                         final_content[idx] = data.get("content_block")
-                    
+
                     elif dtype == "content_block_delta":
                         idx = data.get("index", 0)
                         delta = data.get("delta", {})
@@ -786,7 +757,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                                 if "partial_json" not in final_content[idx]:
                                     final_content[idx]["partial_json"] = ""
                                 final_content[idx]["partial_json"] += delta.get("partial_json", "")
-                    
+
                     elif dtype == "content_block_stop":
                         idx = data.get("index", 0)
                         if final_content[idx] and final_content[idx].get("type") == "tool_use":
@@ -797,11 +768,11 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                                     # Keep partial if invalid
                                     final_content[idx]["input"] = {"error": "invalid json", "partial": final_content[idx]["partial_json"]}
                                 del final_content[idx]["partial_json"]
-                    
+
                     elif dtype == "message_delta":
                         usage = data.get("usage", usage)
                         stop_reason = data.get("delta", {}).get("stop_reason")
-                
+
                 except json.JSONDecodeError:
                     # Ignore lines that are not valid JSON
                     pass
@@ -818,7 +789,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                     c.pop("partial_json", None)
                     final_content_cleaned.append(c)
 
-            return JSONResponse(content={
+            response_body = {
                 "id": f"msg_{uuid.uuid4()}",
                 "type": "message",
                 "role": "assistant",
@@ -827,7 +798,11 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                 "stop_reason": stop_reason,
                 "stop_sequence": None,
                 "usage": usage
-            })
+            }
+            if conversation_id:
+                response_body["conversation_id"] = conversation_id
+                response_body["conversationId"] = conversation_id
+            return JSONResponse(content=response_body, headers=response_headers or None)
 
     except Exception as e:
         # Ensure event_iter (if created) is closed to release upstream connection
@@ -1035,8 +1010,8 @@ async def _create_account_from_tokens(
     acc_id = str(uuid.uuid4())
     await _db.execute(
         """
-        INSERT INTO accounts (id, label, clientId, clientSecret, refreshToken, accessToken, other, last_refresh_time, last_refresh_status, created_at, updated_at, enabled)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO accounts (id, label, clientId, clientSecret, refreshToken, accessToken, other, last_refresh_time, last_refresh_status, created_at, updated_at, enabled, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             acc_id,
@@ -1051,6 +1026,7 @@ async def _create_account_from_tokens(
             now,
             now,
             1 if enabled else 0,
+            None,  # expires_at - will be set on first refresh
         ),
     )
     row = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (acc_id,))
@@ -1203,8 +1179,8 @@ if CONSOLE_ENABLED:
         enabled_val = 1 if (body.enabled is None or body.enabled) else 0
         await _db.execute(
             """
-            INSERT INTO accounts (id, label, clientId, clientSecret, refreshToken, accessToken, other, last_refresh_time, last_refresh_status, created_at, updated_at, enabled)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO accounts (id, label, clientId, clientSecret, refreshToken, accessToken, other, last_refresh_time, last_refresh_status, created_at, updated_at, enabled, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 acc_id,
@@ -1219,6 +1195,7 @@ if CONSOLE_ENABLED:
                 now,
                 now,
                 enabled_val,
+                None,  # expires_at - will be set on first refresh
             ),
         )
         row = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (acc_id,))
@@ -1260,8 +1237,8 @@ if CONSOLE_ENABLED:
 
             await _db.execute(
                 """
-                INSERT INTO accounts (id, label, clientId, clientSecret, refreshToken, accessToken, other, last_refresh_time, last_refresh_status, created_at, updated_at, enabled)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO accounts (id, label, clientId, clientSecret, refreshToken, accessToken, other, last_refresh_time, last_refresh_status, created_at, updated_at, enabled, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     acc_id,
@@ -1276,6 +1253,7 @@ if CONSOLE_ENABLED:
                     now,
                     now,
                     0,  # 初始为禁用状态
+                    None,  # expires_at - will be set on first refresh
                 ),
             )
             new_account_ids.append(acc_id)
@@ -1351,6 +1329,26 @@ if CONSOLE_ENABLED:
     @app.post("/v2/accounts/{account_id}/refresh")
     async def manual_refresh(account_id: str, _: bool = Depends(verify_admin_password)):
         return await refresh_access_token_in_db(account_id)
+
+    @app.post("/v2/chat/test")
+    async def admin_chat_test(req: ChatCompletionRequest, account_id: Optional[str] = None, _: bool = Depends(verify_admin_password)):
+        """Admin chat test - uses admin auth, selects account by id or random."""
+        if account_id:
+            row = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (account_id,))
+            if not row:
+                raise HTTPException(status_code=404, detail="Account not found")
+            account = _row_to_dict(row)
+            # Check if token is expired or missing
+            expires_at = account.get("expires_at")
+            now_str = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+            if not expires_at or expires_at <= now_str:
+                account = await refresh_access_token_in_db(account_id)
+        else:
+            candidates = await _list_enabled_accounts()
+            if not candidates:
+                raise HTTPException(status_code=503, detail="No enabled account available")
+            account = random.choice(candidates)
+        return await chat_completions(req, account)
 
     # ------------------------------------------------------------------------------
     # Simple Frontend (minimal dev test page; full UI in v2/frontend/index.html)
